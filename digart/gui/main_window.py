@@ -122,7 +122,7 @@ class MainWindow(QMainWindow):
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._run_preview)
 
-        self.setWindowTitle("digart")
+        self.setWindowTitle("phabrillust")
         self.setMinimumSize(1200, 800)
         self.resize(1400, 900)
 
