@@ -66,18 +66,16 @@ def apply_pipeline(
 
     ordered = by_category["glitch"] + by_category["noise"] + by_category["databend"]
     image = source.convert("RGB")
+    if preview:
+        from digart.engine.renderer import make_preview
+
+        image = make_preview(image, max_preview_side)
 
     for effect, params in ordered:
         try:
             rng = get_rng(global_seed, salt=effect.id)
             image = effect.apply(image, params, rng)
-            image = image.convert("RGB")
         except Exception as exc:
             warnings.append(f"{effect.name} failed: {exc}")
-
-    if preview:
-        from digart.engine.renderer import make_preview
-
-        image = make_preview(image, max_preview_side)
 
     return image, warnings

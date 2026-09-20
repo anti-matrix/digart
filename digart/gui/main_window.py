@@ -49,7 +49,7 @@ from digart.engine.source_generator import (
     solid,
 )
 from digart.gui.widgets import EffectPanel
-from digart.gui.worker import PreviewWorker
+from digart.gui.worker import ExportWorker, PreviewWorker
 
 
 class Canvas(QLabel):
@@ -112,6 +112,7 @@ class MainWindow(QMainWindow):
         self._latest_finished_counter = 0
         self._active_workers: set[PreviewWorker] = set()
         self._closing = False
+        self._export_worker: ExportWorker | None = None
         self._thread_pool = QThreadPool()
         self._thread_pool.setMaxThreadCount(1)
         self._warning_timer = QTimer(self)
@@ -293,7 +294,7 @@ class MainWindow(QMainWindow):
         self._preview_counter += 1
         counter = self._preview_counter
         self.processing_label.setText("Processing…")
-        source = self.state.current.copy()
+        source = self.state.current
         enabled = self._enabled_effects()
         worker = PreviewWorker(
             counter,
@@ -305,12 +306,21 @@ class MainWindow(QMainWindow):
         worker.setAutoDelete(False)
         self._active_workers.add(worker)
 
-        def on_done(c: int, img: Image.Image | None, warns: list[str], w: PreviewWorker = worker) -> None:
-            self._active_workers.discard(w)
+        def on_done(c: int, img: Image.Image | None, warns: list[str]) -> None:
+            self._active_workers.discard(worker)
             self._on_preview_finished(c, img, warns)
-            w.deleteLater()
+            # Break the closure<->signal reference cycle (the C++ connection
+            # holds a strong ref to this closure that Python's GC cannot see),
+            # so the worker and its full-res image reference can be freed.
+            try:
+                worker.signals.finished.disconnect(on_done)
+            except Exception:
+                pass
+            # PySide6 with setAutoDelete(False) may retain the QRunnable wrapper
+            # itself; drop the full-res image reference so memory is released.
+            worker.source = None
 
-        worker.signals.finished.connect(on_done)
+        worker.signals.finished.connect(on_done, Qt.ConnectionType.QueuedConnection)
         self._thread_pool.start(worker)
 
     def _on_preview_finished(self, counter: int, image: Image.Image | None, warnings: list[str]) -> None:
@@ -319,23 +329,23 @@ class MainWindow(QMainWindow):
         if counter < self._latest_finished_counter:
             return
         self._latest_finished_counter = counter
-        self.processing_label.setText("")
+        if self._export_worker is None:
+            self.processing_label.setText("")
         if image is None:
             self._show_warning("Preview failed")
             return
         self.canvas.set_pil_image(image)
-        self._update_status_dim(image.size)
+        self._update_status_dim(self.state.current.size)
         if warnings:
             self._show_warning("; ".join(warnings))
 
     def _update_status_dim(self, size: tuple[int, int]) -> None:
         w, h = size
         self.status_dim_label.setText(f"{w}×{h}")
-        if self.canvas._base_size and self.canvas._displayed_size:
-            bw, bh = self.canvas._base_size
+        if w and h and self.canvas._displayed_size:
             dw, dh = self.canvas._displayed_size
-            fit_w = dw / bw * 100 if bw else 100
-            fit_h = dh / bh * 100 if bh else 100
+            fit_w = dw / w * 100
+            fit_h = dh / h * 100
             self.status_fit_label.setText(f"fit {min(fit_w, fit_h):.0f}%")
 
     def _show_warning(self, text: str) -> None:
@@ -450,6 +460,8 @@ class MainWindow(QMainWindow):
         if not self.state.has_image:
             QMessageBox.warning(self, "Export", "No image to export.")
             return
+        if self._export_worker is not None:
+            return
 
         path, selected = QFileDialog.getSaveFileName(
             self,
@@ -467,26 +479,58 @@ class MainWindow(QMainWindow):
             if not ok:
                 return
 
-        try:
-            image, warnings = apply_pipeline(
-                self.state.current,
-                self._enabled_effects(),
-                self.global_seed,
-                preview=False,
-            )
-            if is_jpeg:
-                image.convert("RGB").save(path, "JPEG", quality=quality, optimize=True)
-            else:
-                image.save(path, "PNG")
+        self._start_export(path, is_jpeg, quality)
+
+    def _start_export(self, path: str, is_jpeg: bool, quality: int) -> None:
+        self._set_export_active(True)
+        worker = ExportWorker(
+            self.state.current,
+            self._enabled_effects(),
+            self.global_seed,
+            path,
+            is_jpeg,
+            quality,
+        )
+        worker.setAutoDelete(False)
+        self._export_worker = worker
+
+        def on_finished(warnings: list[str]) -> None:
+            if self._closing:
+                return
+            self._export_worker = None
+            self._set_export_active(False)
             if warnings:
                 self._show_warning("Export warnings: " + "; ".join(warnings))
-        except Exception as exc:
-            QMessageBox.critical(self, "Export failed", str(exc))
+
+        def on_error(msg: str) -> None:
+            if self._closing:
+                return
+            self._export_worker = None
+            self._set_export_active(False)
+            QMessageBox.critical(self, "Export failed", msg)
+
+        worker.signals.finished.connect(on_finished, Qt.ConnectionType.QueuedConnection)
+        worker.signals.error.connect(on_error, Qt.ConnectionType.QueuedConnection)
+        self._thread_pool.start(worker)
+
+    def _set_export_active(self, active: bool) -> None:
+        self.centralWidget().setEnabled(not active)
+        self.processing_label.setText("Exporting…" if active else "")
 
     def closeEvent(self, event) -> None:
         self._closing = True
         self._preview_timer.stop()
         self._thread_pool.clear()
+        if self._export_worker is not None:
+            try:
+                self._export_worker.signals.finished.disconnect()
+            except Exception:
+                pass
+            try:
+                self._export_worker.signals.error.disconnect()
+            except Exception:
+                pass
+            self._export_worker = None
         for worker in list(self._active_workers):
             try:
                 worker.signals.finished.disconnect()
