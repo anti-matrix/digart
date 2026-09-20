@@ -112,8 +112,8 @@ class ValueNoise(Effect):
             noise += zoomed * amp
             total_amp += amp
             amp *= persistence
-            base_h *= 2
-            base_w *= 2
+            base_h = min(base_h * 2, h)
+            base_w = min(base_w * 2, w)
 
         noise = (noise / total_amp) * 255
         if not per_channel:
