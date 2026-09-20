@@ -118,6 +118,42 @@ def test_export_unchanged() -> None:
     print("[OK] export pixel output unchanged")
 
 
+def test_value_noise_lattice_clamped_and_returns_rgb() -> None:
+    from digart.effects.noise import ValueNoise
+
+    effect = ValueNoise()
+    source = Image.new("RGB", (120, 80), (128, 128, 128))
+
+    seen_shapes = []
+
+    def capturing_zoom(layer, zoom, order=1):
+        seen_shapes.append(layer.shape)
+        return original_zoom(layer, zoom, order=order)
+
+    import scipy.ndimage as ndi
+
+    original_zoom = ndi.zoom
+    ndi.zoom = capturing_zoom
+    try:
+        rng = get_rng(12345, salt=effect.id)
+        result = effect.apply(
+            source,
+            {"scale": 1, "octaves": 8, "persistence": 0.5, "per_channel": True},
+            rng,
+        )
+    finally:
+        ndi.zoom = original_zoom
+
+    assert all(sh[0] <= 80 for sh in seen_shapes), f"layer h exceeded image: {seen_shapes}"
+    assert all(sh[1] <= 120 for sh in seen_shapes), f"layer w exceeded image: {seen_shapes}"
+
+    assert isinstance(result, Image.Image)
+    assert result.mode == "RGB"
+    assert result.size == source.size
+
+    print("[OK] value noise lattice clamped and returns RGB")
+
+
 def test_export_nonblocking(app: QApplication) -> None:
     state = ImageState()
     state.set_source(solid(500, 500, (128, 128, 128)))
@@ -159,6 +195,7 @@ def main() -> None:
     test_preview_downscaled_before_effects()
     test_preview_worker_no_leak(app)
     test_export_unchanged()
+    test_value_noise_lattice_clamped_and_returns_rgb()
     test_export_nonblocking(app)
     print("ALL VERIFICATION PASSED")
 
