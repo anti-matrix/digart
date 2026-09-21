@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import io
 import os
+import re
 import sys
 import tempfile
 import time
@@ -189,6 +190,132 @@ def test_export_nonblocking(app: QApplication) -> None:
     print("[OK] export non-blocking")
 
 
+def test_export_signature() -> None:
+    from digart.engine.signature import (
+        SIGNATURE,
+        inject_jpeg_comment,
+        jpeg_exif_bytes,
+        pnginfo_with_signature,
+    )
+    from PIL.ExifTags import Base, IFD
+
+    sig_bytes = SIGNATURE.encode("ascii")
+
+    png_path = tempfile.mktemp(suffix=".png")
+    try:
+        img = Image.new("RGB", (8, 8), (64, 128, 32))
+        img.save(png_path, "PNG", pnginfo=pnginfo_with_signature())
+        data = open(png_path, "rb").read()
+        assert sig_bytes in data, "PNG raw bytes missing signature"
+        ihdr_pos = data.find(b"IHDR")
+        idat_pos = data.find(b"IDAT")
+        sig_pos = data.find(sig_bytes)
+        assert 0 < ihdr_pos < sig_pos < idat_pos, "PNG signature chunk does not precede IDAT"
+        info = Image.open(png_path).info
+        assert info.get("Title") == SIGNATURE
+        assert info.get("Author") == "@anti-matrix"
+        assert info.get("Copyright") == SIGNATURE
+        assert info.get("Comment") == SIGNATURE
+        assert info.get("Software") == "phabrillust"
+        creation_time = info.get("Creation Time")
+        assert creation_time is not None
+        assert re.fullmatch(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$", creation_time)
+    finally:
+        if os.path.exists(png_path):
+            os.remove(png_path)
+
+    jpeg_path = tempfile.mktemp(suffix=".jpg")
+    try:
+        img = Image.new("RGB", (8, 8), (64, 128, 32))
+        img.save(jpeg_path, "JPEG", quality=85, optimize=True, exif=jpeg_exif_bytes())
+        inject_jpeg_comment(jpeg_path)
+        data = open(jpeg_path, "rb").read()
+        assert data[:2] == b'\xff\xd8', "JPEG missing SOI"
+        assert data.count(b'\xff\xd8') == 1, "JPEG extra SOI"
+        assert data[2:4] == b'\xff\xfe', "JPEG COM not after SOI"
+        length = int.from_bytes(data[4:6], "big")
+        assert length == 2 + len(SIGNATURE)
+        assert data[6:6 + len(SIGNATURE)] == sig_bytes
+        assert sig_bytes in data, "JPEG raw bytes missing signature"
+        exif = Image.open(jpeg_path).getexif()
+        assert exif[Base.ImageDescription] == SIGNATURE
+        assert exif[Base.Artist] == "@anti-matrix"
+        assert exif[Base.Copyright] == SIGNATURE
+        assert exif[Base.Software] == "phabrillust"
+        assert exif[Base.XPTitle] == SIGNATURE.encode("utf-16-le") + b'\0\0'
+        assert exif[Base.XPComment] == SIGNATURE.encode("utf-16-le") + b'\0\0'
+        assert exif[Base.XPAuthor] == "@anti-matrix".encode("utf-16-le") + b'\0\0'
+        assert re.fullmatch(r"^\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}$", exif[Base.DateTime])
+        exif_sub = exif.get_ifd(IFD.Exif)
+        user_comment = exif_sub[Base.UserComment]
+        assert user_comment.startswith(b'ASCII\0\0\0')
+        assert user_comment.endswith(sig_bytes)
+        assert exif_sub[Base.DateTimeOriginal] == exif[Base.DateTime]
+        assert exif_sub[Base.DateTimeDigitized] == exif[Base.DateTime]
+        assert Base.GPSInfo not in exif, "GPS info must not be present"
+    finally:
+        if os.path.exists(jpeg_path):
+            os.remove(jpeg_path)
+
+    print("[OK] export signature PNG and JPEG")
+
+
+def test_export_worker_signature(app: QApplication) -> None:
+    from digart.engine.signature import SIGNATURE
+    from digart.gui.worker import ExportWorker
+    from PIL.ExifTags import Base
+    from PySide6.QtCore import QThreadPool
+
+    source = Image.new("RGB", (64, 64), (64, 128, 32))
+    effects = [(e, {}) for e in GLITCH_EFFECTS + NOISE_EFFECTS + DATABEND_EFFECTS]
+    sig_bytes = SIGNATURE.encode("ascii")
+
+    for suffix, is_jpeg in ((".png", False), (".jpg", True)):
+        path = tempfile.mktemp(suffix=suffix)
+        worker = ExportWorker(
+            source=source,
+            enabled_effects=effects,
+            global_seed=42,
+            path=path,
+            is_jpeg=is_jpeg,
+            quality=85,
+        )
+        state = {"finished": False, "error": None}
+        worker.signals.finished.connect(
+            lambda _w, _s=state: _s.__setitem__("finished", True)
+        )
+        worker.signals.error.connect(
+            lambda msg, _s=state: _s.__setitem__("error", msg)
+        )
+        QThreadPool.globalInstance().start(worker)
+        deadline = time.time() + 30
+        while not state["finished"] and state["error"] is None and time.time() < deadline:
+            app.processEvents()
+            time.sleep(0.005)
+        assert state["error"] is None, f"export worker error for {suffix}: {state['error']}"
+        assert state["finished"], f"export worker did not finish for {suffix}"
+        assert os.path.exists(path), f"export did not create {suffix} file"
+        data = open(path, "rb").read()
+        assert sig_bytes in data, f"{suffix} raw bytes missing signature"
+        with Image.open(path) as img:
+            assert img.size == (64, 64)
+            if is_jpeg:
+                exif = img.getexif()
+                assert Base.GPSInfo not in exif, "JPEG GPS info must not be present"
+                assert re.fullmatch(
+                    r"^\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}$", exif[Base.DateTime]
+                )
+            else:
+                info = img.info
+                assert re.fullmatch(
+                    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$", info.get("Creation Time")
+                )
+                assert info.get("Software") == "phabrillust"
+        os.remove(path)
+
+    print("[OK] export worker signature")
+
+
 def main() -> None:
     app = QApplication(sys.argv)
     test_preview_no_crash_and_downscale(app)
@@ -197,6 +324,8 @@ def main() -> None:
     test_export_unchanged()
     test_value_noise_lattice_clamped_and_returns_rgb()
     test_export_nonblocking(app)
+    test_export_signature()
+    test_export_worker_signature(app)
     print("ALL VERIFICATION PASSED")
 
 
